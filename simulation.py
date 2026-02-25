@@ -100,6 +100,94 @@ def _load_food_table() -> list:
     return result
 
 
+WEAPON_NAMES = ["검", "양손검", "활", "단검", "지팡이"]
+
+def _load_enhance_table() -> dict:
+    """강화 단계별 성공 확률 로드.
+    반환: {1: 0.90, 2: 0.80, ..., 9: 0.10}
+    """
+    table = {}
+    with open(os.path.join(DATA_DIR, "weapon_enhance.csv"), encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            step_str = row.get("강화단계", "").strip().lstrip("+")
+            rate_str = row.get("성공확률", "").strip()
+            if step_str and rate_str:
+                table[int(step_str)] = float(rate_str)
+    return table
+
+
+def _run_enhance(enhance_table: dict, weapon_tier: int, stop_atk: int,
+                 start_level: int = 0) -> tuple:
+    """무기 1개를 start_level 부터 이어서 강화 시도.
+    - 강화 성공 후 ATK > stop_atk 이면 즉시 중단 → 장착 권장
+    - 강화 실패 → 즉시 파괴
+    - 최대 강화 도달(파괴 없음) → 폐기 (더 약하거나 동급)
+    반환: (final_level, equipped, destroyed)
+    """
+    max_enhance = max(enhance_table.keys()) if enhance_table else 9
+    level = start_level
+    for next_level in range(start_level + 1, max_enhance + 1):
+        rate = enhance_table.get(next_level, 0.0)
+        if rate == 0:
+            break
+        if random.random() < rate:
+            level = next_level
+            if calc_weapon_atk(weapon_tier, level) > stop_atk:
+                return level, True, False   # 장착
+        else:
+            return level, False, True       # 파괴
+    return level, False, False              # 최대 강화 달성, ATK 부족 → 폐기
+
+
+def _load_weapon_stat_table() -> dict:
+    """티어별 무기 기본 공격력 로드. 반환: {tier: base_atk}"""
+    table = {}
+    with open(os.path.join(DATA_DIR, "weapon_stat.csv"), encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            tier_str = row.get("티어", "").strip()
+            atk_str  = row.get("기본공격력", "").strip()
+            if tier_str.startswith("Tier") and atk_str:
+                table[int(tier_str.replace("Tier", ""))] = int(atk_str)
+    return table
+
+
+def _load_weapon_enhance_stat_table() -> dict:
+    """티어별 강화 1회당 공격력 증가량 로드. 반환: {tier: atk_per_enhance}"""
+    table = {}
+    with open(os.path.join(DATA_DIR, "weapon_enhance_stat.csv"), encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            tier_str = row.get("티어", "").strip()
+            val_str  = row.get("강화당증가량", "").strip()
+            if tier_str.startswith("Tier") and val_str:
+                table[int(tier_str.replace("Tier", ""))] = int(val_str)
+    return table
+
+
+def _load_weapon_drop_table() -> dict:
+    """사냥터 티어별 무기 드랍 테이블 로드.
+    각 무기의 개별 드랍 확률을 합산해 총 드랍 확률을 계산하고,
+    드랍 시 무기 종류 선택에 사용할 가중치를 함께 저장.
+
+    반환: {tier: {'total': float, 'weights': [float, ...]}}
+    """
+    table = {}
+    with open(os.path.join(DATA_DIR, "weapon_drop.csv"), encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            tier_str = row.get("사냥터", "").strip()
+            if not tier_str.startswith("Tier"):
+                continue
+            tier_num = int(tier_str.replace("Tier", ""))
+            weights = []
+            for name in WEAPON_NAMES:
+                val = row.get(name, "").strip()
+                weights.append(float(val) if val else 0.0)
+            table[tier_num] = {
+                "total":   sum(weights),
+                "weights": weights,
+            }
+    return table
+
+
 # 모듈 임포트 시 CSV 읽기
 LEVEL_EXP_TABLE      = _load_level_exp_table("v1")  # 기본값 (Character 생성 시 fallback)
 MONSTER_TEMPLATES    = _load_monster_templates("v1")  # 기본값 (Monster 생성 시 fallback)
@@ -107,11 +195,25 @@ DIFFICULTY_TABLE     = _load_difficulty_table()
 CHARACTER_TIER_TABLE = _load_character_tier_table()
 POTION_TABLE         = _load_potion_table()
 FOOD_TABLE           = _load_food_table()
+WEAPON_DROP_TABLE         = _load_weapon_drop_table()
+ENHANCE_TABLE             = _load_enhance_table()
+WEAPON_STAT_TABLE         = _load_weapon_stat_table()
+WEAPON_ENHANCE_STAT_TABLE = _load_weapon_enhance_stat_table()
+
+
+def calc_weapon_atk(tier: int, enhance: int) -> int:
+    """티어 + 강화 단계로 무기 공격력 계산."""
+    base   = WEAPON_STAT_TABLE.get(tier, 0)
+    bonus  = WEAPON_ENHANCE_STAT_TABLE.get(tier, 0) * enhance
+    return base + bonus
 
 # ── 소비 아이템 설정 ──────────────────────────────────────
 POTION_COOLDOWN     = 60.0   # 포션 쿨타임 (초) — 전투 중 사용
 FOOD_COOLDOWN       = 20.0   # 음식 쿨타임 (초) — 전투 외 사용
 POTION_HP_THRESHOLD = 0.5    # HP 50% 미만일 때 포션 자동 사용
+
+# ── 무기 강화 설정 ────────────────────────────────────────
+# 고정 목표 없음 — 현재 장착 무기 공격력을 초과하는 순간 강화 중단 후 장착
 
 
 # =========================================================
@@ -163,8 +265,12 @@ class Character:
         self.exp = 0           # 현재 레벨 내 누적 EXP (레벨업 시 초과분만 이월)
         self.total_exp = 0     # 전체 누적 EXP (통계용)
         _ct = min((level - 1) // 10 + 1, max(CHARACTER_TIER_TABLE.keys()))
-        self.atk  = CHARACTER_TIER_TABLE[_ct]["atk"]
         self.defe = CHARACTER_TIER_TABLE[_ct]["defe"]
+        # 무기 — 기본 장착: Tier1 양손검 +0
+        self.weapon_type    = "양손검"
+        self.weapon_tier    = 1
+        self.weapon_enhance = 0
+        self.atk = calc_weapon_atk(self.weapon_tier, self.weapon_enhance)
         self.skills = {
             "Q": Skill("Q", "강력한 일격", 2.0, 1.0,  5.0, 10),
             "W": Skill("W", "연속 베기",   2.5, 1.0, 12.0, 30, is_aoe=True),
@@ -191,7 +297,7 @@ class Character:
         return new_levels
 
     def level_up(self):
-        """레벨업: HP/MP 증가, 티어 전환 시 ATK/DEF를 CSV 기준값으로 교체"""
+        """레벨업: HP/MP 증가, 티어 전환 시 DEF를 CSV 기준값으로 교체. ATK는 무기 기반."""
         old_tier = min((self.level - 1) // 10 + 1, max(CHARACTER_TIER_TABLE.keys()))
         self.level  += 1
         self.max_hp += 100
@@ -200,7 +306,6 @@ class Character:
         self.mp = min(self.mp + 20,  self.max_mp)
         new_tier = min((self.level - 1) // 10 + 1, max(CHARACTER_TIER_TABLE.keys()))
         if new_tier != old_tier:
-            self.atk  = CHARACTER_TIER_TABLE[new_tier]["atk"]
             self.defe = CHARACTER_TIER_TABLE[new_tier]["defe"]
 
     def reset_for_next_fight(self):
@@ -650,7 +755,7 @@ def _tier_for_level(level: int) -> int:
 # =========================================================
 #  레벨업 시뮬레이션 — 내부 계산 (출력 없음)
 # =========================================================
-def _run_leveling(target_level: int = 60, difficulty: str = "Normal",
+def _run_leveling(target_level: int = 70, difficulty: str = "Normal",
                   exp_version: str = "v1", seed: int = None) -> dict:
     """
     레벨업 시뮬레이션 루프를 실행하고 통계 dict 를 반환 (화면 출력 없음).
@@ -681,6 +786,15 @@ def _run_leveling(target_level: int = 60, difficulty: str = "Normal",
     total_fights    = 0
     groups_2        = 0
     groups_3        = 0
+    weapon_drops      = {name: 0 for name in WEAPON_NAMES}
+    tier_weapon_drops = {t: {name: 0 for name in WEAPON_NAMES} for t in range(1, max_tier + 1)}
+    # 강화 결과: 결과별로 분리 (key = 최종 달성 강화 단계)
+    enhance_destroyed = {i: 0 for i in range(10)}   # 강화 실패 → 파괴
+    enhance_equipped  = {i: 0 for i in range(10)}   # ATK 초과 → 장착 후 중단
+    enhance_discarded = {i: 0 for i in range(10)}   # 최대 강화 도달, ATK 부족 → 폐기
+    weapon_equips     = 0
+    weapons_destroyed = 0
+    weapon_log        = []   # 무기 교체 이력
 
     level_time = {1: 0.0}
 
@@ -710,6 +824,53 @@ def _run_leveling(target_level: int = 60, difficulty: str = "Normal",
         total_kills             += kills
         tier_kills[tier]        += kills
         tier_combat_time[tier]  += combat_time
+
+        # ── 무기 드랍 (2단계: 총확률 1회 → 무기 종류 가중 선택) ──
+        wt = WEAPON_DROP_TABLE.get(tier)
+        if wt and wt["total"] > 0:
+            for _ in range(kills):
+                if random.random() < wt["total"]:
+                    chosen = random.choices(WEAPON_NAMES, weights=wt["weights"])[0]
+                    weapon_drops[chosen] += 1
+                    tier_weapon_drops[tier][chosen] += 1
+                    # ── 무기 대결: 한쪽이 파괴/폐기될 때까지 교대로 강화 도전 ──
+                    ch_type, ch_tier, ch_enhance = chosen, tier, 0
+                    while True:
+                        enh_lv, eq, dest = _run_enhance(
+                            ENHANCE_TABLE, ch_tier, player.atk, ch_enhance)
+                        if dest:
+                            enhance_destroyed[enh_lv] += 1
+                            weapons_destroyed += 1
+                            break
+                        elif eq:
+                            enhance_equipped[enh_lv] += 1
+                            new_atk = calc_weapon_atk(ch_tier, enh_lv)
+                            weapon_log.append({
+                                "level":       player.level,
+                                "old_type":    player.weapon_type,
+                                "old_tier":    player.weapon_tier,
+                                "old_enhance": player.weapon_enhance,
+                                "old_atk":     player.atk,
+                                "new_type":    ch_type,
+                                "new_tier":    ch_tier,
+                                "new_enhance": enh_lv,
+                                "new_atk":     new_atk,
+                            })
+                            # 승자 정보 저장 후 스왑
+                            win_type, win_tier, win_enhance, win_atk = ch_type, ch_tier, enh_lv, new_atk
+                            # 구 장착 무기가 도전자로 전환 (현재 강화 단계부터 이어서)
+                            ch_type    = player.weapon_type
+                            ch_tier    = player.weapon_tier
+                            ch_enhance = player.weapon_enhance
+                            # 승자 장착
+                            player.weapon_type    = win_type
+                            player.weapon_tier    = win_tier
+                            player.weapon_enhance = win_enhance
+                            player.atk            = win_atk
+                            weapon_equips += 1
+                        else:
+                            enhance_discarded[enh_lv] += 1
+                            break
 
         if victory:
             for lv in player.add_exp(exp_gained):
@@ -753,16 +914,30 @@ def _run_leveling(target_level: int = 60, difficulty: str = "Normal",
         "groups_3":         groups_3,
         "max_tier":         max_tier,
         "level_time":       level_time,
-        "tier_kills":       tier_kills,
-        "tier_fights":      tier_fights,
-        "tier_combat_time": tier_combat_time,
+        "tier_kills":         tier_kills,
+        "tier_fights":        tier_fights,
+        "tier_combat_time":   tier_combat_time,
+        "weapon_drops":       weapon_drops,
+        "tier_weapon_drops":  tier_weapon_drops,
+        "enhance_destroyed":  enhance_destroyed,
+        "enhance_equipped":   enhance_equipped,
+        "enhance_discarded":  enhance_discarded,
+        "weapons_destroyed":  weapons_destroyed,
+        "weapon_equips":      weapon_equips,
+        "weapon_log":         weapon_log,
+        "final_weapon": {
+            "type":    player.weapon_type,
+            "tier":    player.weapon_tier,
+            "enhance": player.weapon_enhance,
+            "atk":     player.atk,
+        },
     }
 
 
 # =========================================================
 #  레벨업 시뮬레이션 — 결과 출력
 # =========================================================
-def _print_leveling_stats(stats: dict):
+def _print_leveling_stats(stats: dict, show_weapon_log: bool = False):
     """_run_leveling() 반환 dict 를 받아 티어별 상세 + 전체 요약 출력."""
     target_level      = stats["target_level"]
     difficulty        = stats["difficulty"]
@@ -791,8 +966,8 @@ def _print_leveling_stats(stats: dict):
 
     print("  [티어별 상세 통계]")
     print(DIV)
-    print(f"  {'Tier':<7} {'레벨 구간':<9} {'처치 수':>9}     {'그룹 수':>8}  "
-          f"{'평균 전투(초)':>15}  {'통과 시간(분)':>16}  {'통과(시간)':>13}")
+    print(f"  {'Tier':<7} {'레벨 구간':<6} {'처치 수':>7}     {'그룹 수':>7}  "
+          f"{'평균 전투(초)':>13}  {'통과 시간(분)':>12}  {'통과(시간)':>12}")
     print(DIV)
 
     for t in range(1, num_tiers + 1):
@@ -809,8 +984,8 @@ def _print_leveling_stats(stats: dict):
             print(f"  {'Tier'+str(t):<7} Lv.{start_lv:>2}~{end_lv:<6} "
                   f"{tier_kills[t]:>9,}    {tier_fights[t]:>9,}  "
                   f"{avg_ct:>15.2f}  "
-                  f"{duration / 60:>16.1f}  "
-                  f"{duration / 3600:>13.3f}")
+                  f"{int(duration / 60):>12,}  "
+                  f"{int(duration / 3600):>12,}")
 
     print(DIV)
 
@@ -830,9 +1005,113 @@ def _print_leveling_stats(stats: dict):
     print(f"  평균 전투 시간 : {avg_all:>14.2f} 초/전투")
     print("=" * W)
 
+    weapon_drops      = stats.get("weapon_drops", {})
+    tier_weapon_drops = stats.get("tier_weapon_drops", {})
+    total_drops       = sum(weapon_drops.values())
 
-def simulate_leveling(target_level: int = 60, difficulty: str = "Normal",
-                      exp_version: str = "v1", seed: int = None):
+    print(f"\n  [무기 드랍 통계 — 티어별]")
+    name_hdr = "  ".join(f"{n:>5}" for n in WEAPON_NAMES)
+    print(f"  {'':8}  {name_hdr}   {'합계':>5}   {'평균 획득(h)':>11}")
+    print(DIV)
+    for t in sorted(tier_weapon_drops.keys()):
+        if t > max_tier:
+            break
+        row_drops = tier_weapon_drops[t]
+        row_total = sum(row_drops.values())
+        cols = "  ".join(f"{row_drops[n]:>5,}" for n in WEAPON_NAMES)
+        start_lv = (t - 1) * 10 + 1
+        end_lv   = min(t * 10, target_level)
+        t_start  = level_time.get(start_lv, 0.0)
+        t_end    = level_time.get(end_lv + 1, total_time)
+        duration = t_end - t_start
+        avg_h    = f"{duration / 3600 / row_total:>11.2f}" if row_total > 0 else f"{'  -':>11}"
+        print(f"  Tier{t} Lv{start_lv:>2}~{end_lv:<3}  {cols}   {row_total:>5,}   {avg_h}")
+    print(DIV)
+    total_cols = "  ".join(f"{weapon_drops[n]:>5,}" for n in WEAPON_NAMES)
+    total_avg_h = f"{total_time / 3600 / total_drops:>11.2f}" if total_drops > 0 else f"{'  -':>11}"
+    print(f"  {'합계':8}  {total_cols}   {total_drops:>5,}   {total_avg_h}")
+    print("=" * W)
+
+    enhance_destroyed = stats.get("enhance_destroyed", {})
+    enhance_equipped  = stats.get("enhance_equipped",  {})
+    enhance_discarded = stats.get("enhance_discarded", {})
+    weapons_destroyed = stats.get("weapons_destroyed", 0)
+    weapon_equips     = stats.get("weapon_equips", 0)
+
+    all_levels     = sorted(set(enhance_destroyed) | set(enhance_equipped) | set(enhance_discarded))
+    total_enhanced = sum(
+        enhance_destroyed.get(lv, 0) + enhance_equipped.get(lv, 0) + enhance_discarded.get(lv, 0)
+        for lv in all_levels
+    )
+    avg_level = (
+        sum(lv * (enhance_destroyed.get(lv, 0) + enhance_equipped.get(lv, 0) + enhance_discarded.get(lv, 0))
+            for lv in all_levels) / total_enhanced
+        if total_enhanced else 0.0
+    )
+
+    print(f"\n  [강화 시뮬레이션]  (시도 {total_enhanced:,}회 / 실패=즉시 파괴 / 현재 무기 초과 시 장착)")
+    print(DIV)
+    print(f"  {'단계':<8}  {'파괴':>7}  {'장착':>7}  {'폐기':>7}  {'합계':>7}  {'비율':>7}")
+    print(DIV)
+    for lv in all_levels:
+        d = enhance_destroyed.get(lv, 0)
+        e = enhance_equipped.get(lv, 0)
+        s = enhance_discarded.get(lv, 0)
+        row_total = d + e + s
+        if row_total == 0:
+            continue
+        pct   = row_total / total_enhanced * 100 if total_enhanced else 0.0
+        d_str = f"{d:>7,}" if d else f"{'-':>7}"
+        e_str = f"{e:>7,}" if e else f"{'-':>7}"
+        s_str = f"{s:>7,}" if s else f"{'-':>7}"
+        print(f"  {f'+{lv} 종료':<8}  {d_str}  {e_str}  {s_str}  {row_total:>7,}  {pct:>6.1f}%")
+    print(DIV)
+    td = sum(enhance_destroyed.values())
+    te = sum(enhance_equipped.values())
+    ts = sum(enhance_discarded.values())
+    print(f"  {'합계':<8}  {td:>7,}  {te:>7,}  {ts:>7,}  {total_enhanced:>7,}  {'100.0%':>7}")
+    print(f"  평균 달성 강화 단계 : +{avg_level:.2f}" if total_enhanced else "  데이터 없음")
+    print("=" * W)
+
+    # ── 무기 생애주기 요약 ──────────────────────────────────
+    final_weapon      = stats.get("final_weapon", {})
+    total_obtained    = total_drops
+    weapons_discarded_cnt = ts   # enhance_discarded 합계
+
+    fw_type    = final_weapon.get("type",    "양손검")
+    fw_tier    = final_weapon.get("tier",    1)
+    fw_enhance = final_weapon.get("enhance", 0)
+    fw_atk     = final_weapon.get("atk",     0)
+
+    print(f"\n  [무기 생애주기 요약]")
+    print(DIV)
+    print(f"  획득한 무기       : {total_obtained:>8,} 개")
+    print(f"  강화 실패(파괴)   : {weapons_destroyed:>8,} 개")
+    print(f"  장착              : {weapon_equips:>8,} 개  (공격력 초과 → 교체, 구 무기 버려짐)")
+    print(f"  폐기              : {weapons_discarded_cnt:>8,} 개  (최대 강화까지도 현재 무기보다 약함)")
+    print(DIV)
+    print(f"  최종 장착 무기    : {fw_type} Tier{fw_tier}  +{fw_enhance}  (공격력 {fw_atk:,})")
+    print("=" * W)
+
+    # ── 무기 교체 이력 (요청 시에만) ────────────────────────
+    if show_weapon_log:
+        weapon_log = stats.get("weapon_log", [])
+        print(f"\n  [무기 교체 이력]  (총 {len(weapon_log)}회 / 교체 시 구 무기는 버려짐)")
+        print(DIV)
+        if weapon_log:
+            for e in weapon_log:
+                old_s = f"{e['old_type']} Tier{e['old_tier']} +{e['old_enhance']} (ATK {e['old_atk']:,})"
+                new_s = f"{e['new_type']} Tier{e['new_tier']} +{e['new_enhance']} (ATK {e['new_atk']:,})"
+                diff  = e['new_atk'] - e['old_atk']
+                print(f"  Lv.{e['level']:>2}  {old_s}  →  {new_s}  (+{diff:,})")
+        else:
+            print("  교체 없음 (시작 무기 그대로 유지)")
+        print("=" * W)
+
+
+def simulate_leveling(target_level: int = 70, difficulty: str = "Normal",
+                      exp_version: str = "v1", seed: int = None,
+                      show_weapon_log: bool = False):
     """레벨업 시뮬레이션 실행 및 결과 출력."""
     max_tier = max(MONSTER_TEMPLATES.keys())
 
@@ -854,13 +1133,13 @@ def simulate_leveling(target_level: int = 60, difficulty: str = "Normal",
     stats = _run_leveling(target_level, difficulty, exp_version, seed)
 
     print(" 완료!\n")
-    _print_leveling_stats(stats)
+    _print_leveling_stats(stats, show_weapon_log=show_weapon_log)
 
 
 # =========================================================
 #  EXP 버전 비교 시뮬레이션
 # =========================================================
-def simulate_comparison(target_level: int = 60, difficulty: str = "Normal",
+def simulate_comparison(target_level: int = 70, difficulty: str = "Normal",
                         seed: int = 42):
     """
     level_exp.csv 의 모든 EXP 버전을 동일 시드로 실행하여 나란히 비교 출력.
@@ -956,8 +1235,8 @@ if __name__ == "__main__":
                         help="단일 전투 로그를 출력할 몬스터 티어 (예: --log-tier 2).")
     parser.add_argument("--pvp", type=int, metavar="LEVEL",
                         help="PvP 시뮬레이션을 실행할 캐릭터 레벨 (예: --pvp 25).")
-    parser.add_argument("--target-level", type=int, default=60,
-                        help="레벨업 시뮬레이션 목표 레벨 (기본값: 60).")
+    parser.add_argument("--target-level", type=int, default=70,
+                        help="레벨업 시뮬레이션 목표 레벨 (기본값: 70).")
     parser.add_argument("--difficulty", type=str, default="Normal",
                         choices=list(DIFFICULTY_TABLE.keys()),
                         help="난이도 (기본값: Normal).")
