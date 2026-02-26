@@ -3,6 +3,8 @@ import os
 import csv
 import random
 import argparse
+import heapq
+from multiprocessing import Pool, cpu_count
 
 # =========================================================
 #  데이터 디렉터리
@@ -400,69 +402,107 @@ def _consumable_tier(level: int) -> int:
 def _fight(player: Character, monsters: list, duration: float = 300,
            sim_time: float = 0.0) -> tuple:
     """
-    조용한 전투 루프 — 화면 출력 없이 전투 결과만 반환.
-    player 의 HP/MP/스킬 상태를 직접 변경함.
-    EXP 는 반환만 하고 적용하지 않음 (호출자가 처리).
+    이벤트 기반 전투 시뮬레이션 — 다음 행동 시각으로 직접 점프.
+    타임스텝 루프 대비 불필요한 반복을 제거해 속도를 개선.
 
-    sim_time : 시뮬레이션 절대 시각 오프셋 (포션 쿨타임 전투 간 추적용).
-
-    Returns
-    -------
-    (victory: bool, exp_gained: int, kills: int, combat_time: float)
+    이벤트 타입: 0 = 플레이어, 1 = 몬스터(idx)
+    Returns: (victory, exp_gained, kills, combat_time)
     """
-    time_step = 0.1
-    current_time = 0.0
-    action_end_time = 0.0
+    heap   = []
+    _ctr   = 0
 
-    while current_time <= duration:
-        abs_time = sim_time + current_time   # 절대 시뮬레이션 시각 (스킬/포션 쿨타임 공통 기준)
-        alive = [m for m in monsters if m.is_alive()]
-        if not alive or player.hp <= 0.0:
+    def _push(t: float, etype: int, idx: int = -1):
+        nonlocal _ctr
+        heapq.heappush(heap, (t, _ctr, etype, idx))
+        _ctr += 1
+
+    # ── 초기 이벤트: 플레이어와 모든 몬스터를 t=0 에 스케줄 ──
+    _push(0.0, 0)
+    for i in range(len(monsters)):
+        _push(0.0, 1, i)
+
+    action_end_time = 0.0
+    current_time    = 0.0
+
+    while heap:
+        t, _, etype, idx = heapq.heappop(heap)
+
+        if t > duration:
+            current_time = duration
             break
 
+        alive = [m for m in monsters if m.is_alive()]
+        if not alive or player.hp <= 0.0:
+            current_time = t
+            break
+
+        current_time = t
+        abs_time     = sim_time + current_time
+
         # ── 플레이어 행동 ─────────────────────────────────
-        if current_time >= action_end_time:
-            raw_dmg = 0.0
+        if etype == 0:
+            if current_time < action_end_time:
+                _push(action_end_time, 0)
+                continue
+
+            raw_dmg    = 0.0
             used_skill = None
-            cast_time = 0.0
+            cast_time  = 0.0
 
             for sk_name in ["Q", "W", "E", "R"]:
                 sk = player.skills[sk_name]
                 if sk.is_ready(abs_time) and player.mp >= sk.mana_cost:
                     cast_time, raw_dmg, _ = player.use_skill(sk_name, abs_time)
                     used_skill = sk
-                    action_end_time = current_time + cast_time
                     break
 
             if raw_dmg == 0.0:
-                interval = 1.0 / player.attack_speed
-                if current_time - player.last_basic_attack_time >= interval:
+                if current_time - player.last_basic_attack_time >= 1.0 / player.attack_speed:
                     cast_time, raw_dmg, _ = player.basic_attack(current_time)
-                    action_end_time = current_time + cast_time
 
             if raw_dmg > 0.0:
-                is_aoe = used_skill is not None and used_skill.is_aoe
+                is_aoe  = used_skill is not None and used_skill.is_aoe
                 targets = alive if is_aoe else [alive[0]]
-                for t in targets:
-                    t.take_damage(calc_damage(raw_dmg, t.defe))
+                for tgt in targets:
+                    tgt.take_damage(calc_damage(raw_dmg, tgt.defe))
+                action_end_time = current_time + cast_time
+                _push(action_end_time, 0)
+            else:
+                # 스킬·기본공격 모두 불가 → 다음 가능 시각으로 점프
+                next_basic = player.last_basic_attack_time + 1.0 / player.attack_speed
+                next_skill = min(
+                    (sk.last_used_time + sk.cooldown
+                     for sk in player.skills.values()
+                     if player.mp >= sk.mana_cost),
+                    default=float("inf"),
+                )
+                _push(max(current_time + 0.05, min(next_basic, next_skill)), 0)
 
         # ── 몬스터 행동 ───────────────────────────────────
-        for monster in alive:
-            if monster.can_attack(current_time):
-                player.hp = max(0.0, player.hp - calc_damage(monster.do_attack(current_time), player.defe))
+        else:
+            m = monsters[idx]
+            if not m.is_alive():
+                continue
 
-        # ── 포션 자동 사용 (전투 중) ──────────────────────
-        if (player.hp > 0 and
-                player.hp / player.max_hp < POTION_HP_THRESHOLD and
-                abs_time - player.last_potion_time >= POTION_COOLDOWN):
-            potion = POTION_TABLE[_consumable_tier(player.level)]
-            player.hp = min(player.max_hp, player.hp + potion["heal"])
-            player.last_potion_time = abs_time
+            if m.can_attack(current_time):
+                player.hp = max(0.0, player.hp - calc_damage(m.do_attack(current_time), player.defe))
 
-        current_time = round(current_time + time_step, 2)
+                # 포션 자동 사용
+                if (player.hp > 0.0 and
+                        player.hp / player.max_hp < POTION_HP_THRESHOLD and
+                        abs_time - player.last_potion_time >= POTION_COOLDOWN):
+                    potion = POTION_TABLE[_consumable_tier(player.level)]
+                    player.hp = min(player.max_hp, player.hp + potion["heal"])
+                    player.last_potion_time = abs_time
 
-    victory   = player.hp > 0.0
-    kills     = sum(1 for m in monsters if not m.is_alive())
+                if player.hp > 0.0:
+                    _push(current_time + 1.0 / m.attack_speed, 1, idx)
+            else:
+                # t=0 초기 이벤트에서 아직 공격 불가인 경우
+                _push(m.last_attack_time + 1.0 / m.attack_speed, 1, idx)
+
+    victory    = player.hp > 0.0
+    kills      = sum(1 for m in monsters if not m.is_alive())
     exp_gained = sum(m.exp for m in monsters if not m.is_alive()) if victory else 0
     return victory, exp_gained, kills, current_time
 
@@ -756,53 +796,58 @@ def _tier_for_level(level: int) -> int:
 #  레벨업 시뮬레이션 — 내부 계산 (출력 없음)
 # =========================================================
 def _run_leveling(target_level: int = 70, difficulty: str = "Normal",
-                  exp_version: str = "v1", seed: int = None) -> dict:
+                  exp_version: str = "v1", seed: int = None,
+                  level_exp_table: dict = None, monster_templates: dict = None,
+                  lite: bool = False) -> dict:
     """
     레벨업 시뮬레이션 루프를 실행하고 통계 dict 를 반환 (화면 출력 없음).
 
     Parameters
     ----------
-    exp_version : str   level_exp.csv 에서 읽을 열 이름 (예: "v1", "v2")
-    seed        : int   random.seed() 값. None 이면 시드 미설정 (매 실행 다름).
+    level_exp_table  : 사전 로딩된 EXP 테이블. None 이면 CSV 에서 로드.
+    monster_templates: 사전 로딩된 몬스터 템플릿. None 이면 CSV 에서 로드.
+    lite             : True 이면 Monte Carlo 전용 경량 모드 (티어별 세부 통계 생략).
+    seed             : random.seed() 값. None 이면 시드 미설정.
     """
     if seed is not None:
         random.seed(seed)
 
-    level_exp_table   = _load_level_exp_table(exp_version)
+    # 테이블 로딩 — 미리 로드된 값이 없을 때만 CSV 읽기
+    if level_exp_table is None:
+        level_exp_table = _load_level_exp_table(exp_version)
     if not level_exp_table:
-        return {}   # 데이터가 없는 버전은 빈 dict 반환
-
-    # 몬스터 경험치 버전 — 해당 버전 데이터 없으면 v1 fallback
-    monster_templates = _load_monster_templates(exp_version) or MONSTER_TEMPLATES
+        return {}
+    if monster_templates is None:
+        monster_templates = _load_monster_templates(exp_version) or MONSTER_TEMPLATES
 
     ABSORPTION_TIME = 8.0
-    max_tier  = max(monster_templates.keys())
+    max_tier = max(monster_templates.keys())
 
     player = Character(level=1, exp_table=level_exp_table)
 
     total_time      = 0.0
     total_rest_time = 0.0
-    total_kills     = 0
-    total_fights    = 0
-    groups_2        = 0
-    groups_3        = 0
     weapon_drops      = {name: 0 for name in WEAPON_NAMES}
-    tier_weapon_drops = {t: {name: 0 for name in WEAPON_NAMES} for t in range(1, max_tier + 1)}
-    # 강화 결과: 결과별로 분리 (key = 최종 달성 강화 단계)
-    enhance_destroyed = {i: 0 for i in range(10)}   # 강화 실패 → 파괴
-    enhance_equipped  = {i: 0 for i in range(10)}   # ATK 초과 → 장착 후 중단
-    enhance_discarded = {i: 0 for i in range(10)}   # 최대 강화 도달, ATK 부족 → 폐기
     weapon_equips     = 0
     weapons_destroyed = 0
-    weapon_log        = []   # 무기 교체 이력
 
-    level_time = {1: 0.0}
-
-    tier_kills       = {t: 0   for t in range(1, max_tier + 1)}
-    tier_fights      = {t: 0   for t in range(1, max_tier + 1)}
-    tier_groups_2    = {t: 0   for t in range(1, max_tier + 1)}
-    tier_groups_3    = {t: 0   for t in range(1, max_tier + 1)}
-    tier_combat_time = {t: 0.0 for t in range(1, max_tier + 1)}
+    # ── 전체 모드 전용 — 상세 통계 구조 초기화 ──────────────
+    if not lite:
+        total_kills   = 0
+        total_fights  = 0
+        groups_2      = 0
+        groups_3      = 0
+        tier_weapon_drops = {t: {name: 0 for name in WEAPON_NAMES} for t in range(1, max_tier + 1)}
+        enhance_destroyed = {i: 0 for i in range(10)}
+        enhance_equipped  = {i: 0 for i in range(10)}
+        enhance_discarded = {i: 0 for i in range(10)}
+        weapon_log        = []
+        level_time        = {1: 0.0}
+        tier_kills        = {t: 0   for t in range(1, max_tier + 1)}
+        tier_fights       = {t: 0   for t in range(1, max_tier + 1)}
+        tier_groups_2     = {t: 0   for t in range(1, max_tier + 1)}
+        tier_groups_3     = {t: 0   for t in range(1, max_tier + 1)}
+        tier_combat_time  = {t: 0.0 for t in range(1, max_tier + 1)}
 
     while player.level < target_level:
         tier  = _tier_for_level(player.level)
@@ -811,19 +856,21 @@ def _run_leveling(target_level: int = 70, difficulty: str = "Normal",
                             templates=monster_templates)
                     for i in range(count)]
 
-        if count == 2:
-            groups_2 += 1;  tier_groups_2[tier] += 1
-        else:
-            groups_3 += 1;  tier_groups_3[tier] += 1
-        total_fights      += 1
-        tier_fights[tier] += 1
+        if not lite:
+            if count == 2:
+                groups_2 += 1;  tier_groups_2[tier] += 1
+            else:
+                groups_3 += 1;  tier_groups_3[tier] += 1
+            total_fights      += 1
+            tier_fights[tier] += 1
 
         victory, exp_gained, kills, combat_time = _fight(player, monsters, sim_time=total_time)
 
-        total_time              += combat_time
-        total_kills             += kills
-        tier_kills[tier]        += kills
-        tier_combat_time[tier]  += combat_time
+        total_time += combat_time
+        if not lite:
+            total_kills            += kills
+            tier_kills[tier]       += kills
+            tier_combat_time[tier] += combat_time
 
         # ── 무기 드랍 (2단계: 총확률 1회 → 무기 종류 가중 선택) ──
         wt = WEAPON_DROP_TABLE.get(tier)
@@ -832,50 +879,54 @@ def _run_leveling(target_level: int = 70, difficulty: str = "Normal",
                 if random.random() < wt["total"]:
                     chosen = random.choices(WEAPON_NAMES, weights=wt["weights"])[0]
                     weapon_drops[chosen] += 1
-                    tier_weapon_drops[tier][chosen] += 1
+                    if not lite:
+                        tier_weapon_drops[tier][chosen] += 1
                     # ── 무기 대결: 한쪽이 파괴/폐기될 때까지 교대로 강화 도전 ──
                     ch_type, ch_tier, ch_enhance = chosen, tier, 0
                     while True:
                         enh_lv, eq, dest = _run_enhance(
                             ENHANCE_TABLE, ch_tier, player.atk, ch_enhance)
                         if dest:
-                            enhance_destroyed[enh_lv] += 1
+                            if not lite:
+                                enhance_destroyed[enh_lv] += 1
                             weapons_destroyed += 1
                             break
                         elif eq:
-                            enhance_equipped[enh_lv] += 1
-                            new_atk = calc_weapon_atk(ch_tier, enh_lv)
-                            weapon_log.append({
-                                "level":       player.level,
-                                "old_type":    player.weapon_type,
-                                "old_tier":    player.weapon_tier,
-                                "old_enhance": player.weapon_enhance,
-                                "old_atk":     player.atk,
-                                "new_type":    ch_type,
-                                "new_tier":    ch_tier,
-                                "new_enhance": enh_lv,
-                                "new_atk":     new_atk,
-                            })
-                            # 승자 정보 저장 후 스왑
-                            win_type, win_tier, win_enhance, win_atk = ch_type, ch_tier, enh_lv, new_atk
-                            # 구 장착 무기가 도전자로 전환 (현재 강화 단계부터 이어서)
+                            # 승자 ATK 는 lite/full 모두 필요
+                            win_type, win_tier, win_enhance = ch_type, ch_tier, enh_lv
+                            win_atk = calc_weapon_atk(ch_tier, enh_lv)
+                            if not lite:
+                                enhance_equipped[enh_lv] += 1
+                                weapon_log.append({
+                                    "level":       player.level,
+                                    "old_type":    player.weapon_type,
+                                    "old_tier":    player.weapon_tier,
+                                    "old_enhance": player.weapon_enhance,
+                                    "old_atk":     player.atk,
+                                    "new_type":    ch_type,
+                                    "new_tier":    ch_tier,
+                                    "new_enhance": enh_lv,
+                                    "new_atk":     win_atk,
+                                })
                             ch_type    = player.weapon_type
                             ch_tier    = player.weapon_tier
                             ch_enhance = player.weapon_enhance
-                            # 승자 장착
                             player.weapon_type    = win_type
                             player.weapon_tier    = win_tier
                             player.weapon_enhance = win_enhance
                             player.atk            = win_atk
                             weapon_equips += 1
                         else:
-                            enhance_discarded[enh_lv] += 1
+                            if not lite:
+                                enhance_discarded[enh_lv] += 1
                             break
 
         if victory:
-            for lv in player.add_exp(exp_gained):
-                if lv not in level_time:
-                    level_time[lv] = total_time
+            leveled = player.add_exp(exp_gained)
+            if not lite:
+                for lv in leveled:
+                    if lv not in level_time:
+                        level_time[lv] = total_time
 
         player.reset_for_next_fight()
 
@@ -901,6 +952,24 @@ def _run_leveling(target_level: int = 70, difficulty: str = "Normal",
         total_rest_time += rest
         total_time      += rest
 
+    final_weapon = {
+        "type":    player.weapon_type,
+        "tier":    player.weapon_tier,
+        "enhance": player.weapon_enhance,
+        "atk":     player.atk,
+    }
+
+    # ── lite 모드: 최소 결과만 반환 ─────────────────────────
+    if lite:
+        return {
+            "total_time":       total_time,
+            "weapon_drops":     weapon_drops,
+            "weapon_equips":    weapon_equips,
+            "weapons_destroyed": weapons_destroyed,
+            "final_weapon":     final_weapon,
+        }
+
+    # ── 전체 모드: 상세 결과 반환 ────────────────────────────
     return {
         "exp_version":      exp_version,
         "target_level":     target_level,
@@ -925,12 +994,7 @@ def _run_leveling(target_level: int = 70, difficulty: str = "Normal",
         "weapons_destroyed":  weapons_destroyed,
         "weapon_equips":      weapon_equips,
         "weapon_log":         weapon_log,
-        "final_weapon": {
-            "type":    player.weapon_type,
-            "tier":    player.weapon_tier,
-            "enhance": player.weapon_enhance,
-            "atk":     player.atk,
-        },
+        "final_weapon":       final_weapon,
     }
 
 
@@ -1137,6 +1201,113 @@ def simulate_leveling(target_level: int = 70, difficulty: str = "Normal",
 
 
 # =========================================================
+#  Monte Carlo 멀티프로세싱 워커 (모듈 레벨 — pickling 필수)
+# =========================================================
+_MC_LV_TABLE: dict = {}
+_MC_MT_TABLE: dict = {}
+
+
+def _mc_worker_init(lv_table: dict, mt_table: dict):
+    """Pool 워커 프로세스 초기화 — 테이블을 프로세스당 1회만 수신."""
+    global _MC_LV_TABLE, _MC_MT_TABLE
+    _MC_LV_TABLE = lv_table
+    _MC_MT_TABLE = mt_table
+
+
+def _mc_worker(args: tuple) -> dict:
+    """Pool 워커 — 단일 레벨업 시뮬레이션 실행 후 결과 반환."""
+    target_level, difficulty, exp_version = args
+    return _run_leveling(target_level, difficulty, exp_version, seed=None,
+                         level_exp_table=_MC_LV_TABLE,
+                         monster_templates=_MC_MT_TABLE,
+                         lite=True)
+
+
+# =========================================================
+#  Monte Carlo 시뮬레이션
+# =========================================================
+def simulate_monte_carlo(n: int, target_level: int = 70, difficulty: str = "Normal",
+                         exp_version: str = "v1"):
+    """n회 레벨업 시뮬레이션을 병렬 반복하고 결과를 테이블로 출력."""
+    lv_table = _load_level_exp_table(exp_version)
+    if not lv_table:
+        print(f"  [오류] EXP 버전 '{exp_version}' 에 데이터가 없습니다.")
+        return
+    mt_table = _load_monster_templates(exp_version) or MONSTER_TEMPLATES
+
+    workers   = cpu_count() or 1
+    chunksize = max(1, n // (workers * 8))
+    task_args = [(target_level, difficulty, exp_version)] * n
+
+    raw_stats = []
+    done      = 0
+
+    with Pool(initializer=_mc_worker_init, initargs=(lv_table, mt_table)) as pool:
+        for stats in pool.imap_unordered(_mc_worker, task_args, chunksize=chunksize):
+            done += 1
+            print(f"\r  실행 중... {done:,}/{n:,}  ({done / n * 100:.0f}%)",
+                  end="", flush=True)
+            if stats:
+                raw_stats.append(stats)
+
+    print(f"\r  완료! {n:,}회 시뮬레이션  ({workers}코어 병렬)\n")
+
+    results = []
+    for i, stats in enumerate(raw_stats):
+        fw          = stats.get("final_weapon", {})
+        total_drops = sum(stats["weapon_drops"].values())
+        results.append({
+            "run":       i + 1,
+            "hours":     stats["total_time"] / 3600,
+            "drops":     total_drops,
+            "equips":    stats["weapon_equips"],
+            "destroyed": stats["weapons_destroyed"],
+            "fw_type":   fw.get("type",    "-"),
+            "fw_tier":   fw.get("tier",    0),
+            "fw_enh":    fw.get("enhance", 0),
+            "fw_atk":    fw.get("atk",     0),
+        })
+
+    if not results:
+        print("  결과 없음.")
+        return
+
+    W   = 82
+    DIV = "-" * W
+    print("=" * W)
+    print(f"  Monte Carlo  ({n:,}회 / Lv.1→{target_level} / {difficulty} / EXP:{exp_version})")
+    print("=" * W)
+    print(f"  {'#':>6}  {'소요(h)':>8}  {'획득':>5}  {'교체':>5}  {'파괴':>5}  "
+          f"{'최종 무기':<18}  {'ATK':>6}")
+    print(DIV)
+
+    for r in results:
+        fw_str = f"{r['fw_type']} Tier{r['fw_tier']} +{r['fw_enh']}"
+        print(f"  {r['run']:>6,}  {r['hours']:>8.2f}  {r['drops']:>5,}  {r['equips']:>5,}  "
+              f"{r['destroyed']:>5,}  {fw_str:<18}  {r['fw_atk']:>6,}")
+
+    print(DIV)
+
+    def _s(lst):
+        return min(lst), sum(lst) / len(lst), max(lst)
+
+    h_min,  h_avg,  h_max  = _s([r["hours"]     for r in results])
+    d_min,  d_avg,  d_max  = _s([r["drops"]     for r in results])
+    e_min,  e_avg,  e_max  = _s([r["equips"]    for r in results])
+    x_min,  x_avg,  x_max  = _s([r["destroyed"] for r in results])
+    a_min,  a_avg,  a_max  = _s([r["fw_atk"]    for r in results])
+
+    blank = f"{'':18}"
+    print(f"  {'최솟값':>6}  {h_min:>8.2f}  {d_min:>5,}  {e_min:>5,}  {x_min:>5,}  "
+          f"{blank}  {a_min:>6,}")
+    print(f"  {'평균':>6}  {h_avg:>8.2f}  {d_avg:>5.1f}  {e_avg:>5.1f}  {x_avg:>5.1f}  "
+          f"{blank}  {a_avg:>6.0f}")
+    print(f"  {'최댓값':>6}  {h_max:>8.2f}  {d_max:>5,}  {e_max:>5,}  {x_max:>5,}  "
+          f"{blank}  {a_max:>6,}")
+    print("=" * W)
+
+
+# =========================================================
 #  EXP 버전 비교 시뮬레이션
 # =========================================================
 def simulate_comparison(target_level: int = 70, difficulty: str = "Normal",
@@ -1247,6 +1418,8 @@ if __name__ == "__main__":
                              "--seed 미지정 시 seed=42 사용.")
     parser.add_argument("--seed", type=int, default=None,
                         help="랜덤 시드 고정 (기본값: 없음 = 매번 다른 결과).")
+    parser.add_argument("--runs", type=int, default=1, metavar="N",
+                        help="Monte Carlo 반복 횟수 (기본값: 1 = 단일 상세 출력).")
     args = parser.parse_args()
 
     if args.pvp:
@@ -1283,6 +1456,14 @@ if __name__ == "__main__":
             target_level=args.target_level,
             difficulty=args.difficulty,
             seed=compare_seed,
+        )
+    elif args.runs > 1:
+        # ── Monte Carlo 시뮬레이션 ───────────────────────
+        simulate_monte_carlo(
+            n=args.runs,
+            target_level=args.target_level,
+            difficulty=args.difficulty,
+            exp_version=args.exp_ver,
         )
     else:
         # ── 단일 버전 레벨업 시뮬레이션 ─────────────────
